@@ -1,10 +1,16 @@
 #include <stdio.h>
-#include <stdint.h>
+#include <cstdint>
 #include <math.h>
 
 #define MASK(N) ((1u<<(N))-1u)
-#define BIT(V, N) (((V)>>(N))&1u);
+#define BIT(V, N) (((V)>>(N))&1u)
 #define NEGATE(V) ((~(V))+1u)
+
+struct unpacked_double {
+    uint64_t fr : 52;
+    int64_t ex : 11;
+    uint64_t neg : 1;
+} __attribute__((packed));
 
 template <uint8_t bits, uint8_t ebits>
 struct posit {
@@ -16,17 +22,30 @@ struct posit {
 		uint32_t ex;
 		uint32_t fr;
 
+		uint8_t rbits;
+		uint8_t fbits;
+
+		uint32_t encode() {
+			uint8_t regime = 1;
+			if (k >= 0) {
+				regime = (~regime) & MASK(rbits);
+			}
+
+			uint32_t v = (regime << (fbits+ebits)) | (ex << fbits) | fr;
+			return (neg << (bits-1)) | (neg ? (NEGATE(v) & MASK(bits-1)) : v);
+		}
+
 		encoding(posit<bits, ebits> p) {
 			neg = BIT(p.value, bits-1);
-			if (neg != 0) {
+			if (neg) {
 				p.value = NEGATE(p.value);
 			}
 
 			uint8_t regime = __builtin_clrsb(p.value << (1+(32-bits)))+1;
 
 			uint8_t sbits = 1;
-			uint8_t rbits = regime+1;
-			uint8_t fbits = bits - ebits - rbits - sbits;
+			rbits = regime+1;
+			fbits = bits - ebits - rbits - sbits;
 
 			k = -(int8_t)regime;
 			if (BIT(p.value, bits-sbits-1) == 1) {
@@ -38,118 +57,98 @@ struct posit {
 		}
 
 		operator posit() {
-			uint8_t m = k < 0 ? -k : k+1;
-			uint8_t rbits = m+1;
-			uint8_t fbits = bits-1-rbits-ebits;
+			return posit{encode()};
+		}
 
-			uint8_t regime = 1;
-			if (k >= 0) {
-				regime = (~regime) & MASK(rbits);
-			}
+		encoding(double d) {
+			unpacked_double raw = *reinterpret_cast<unpacked_double*>(&d);
+			raw.ex -= MASK(10);
 
-			return posit{(neg << (bits-1)) | (regime << (fbits+ebits)) | (ex << fbits) | fr;
+			neg = raw.neg;
+			k = 0;
+			ex = raw.ex;
+			rbits = 2;
+			uint8_t abits = ebits < bits-1-rbits ? ebits : bits-1-rbits;
+			fbits = 31;
+			fr = raw.fr >> (52-fbits-1);
+			fr = (fr >> 1u) + (fr & 1u);
+			do {
+				k += ex >> abits;
+				ex &= MASK(abits);
+
+				uint8_t m = k < 0 ? -k : k+1;
+
+				rbits = (m >= bits-1) ? (bits-1) : (m+1);
+				abits = ebits < bits-1-rbits ? ebits : bits-1-rbits;
+
+				uint8_t oldfbits = fbits;
+				fbits = bits-1-rbits-abits;
+
+				fr >>= (oldfbits-fbits-1);
+				fr = (fr >> 1u) + (fr & 1u);
+				// ...(2^ex)*(1+fr)
+				if (fr >> fbits) {
+					fr = ((fr+(1u<<fbits))>>1)-(1u<<fbits);
+					ex += 1;
+				}
+			} while ((ex >> abits) > 0 and fbits > 0);
+		}
+
+		operator double() {
+			unpacked_double raw;
+			raw.neg = neg;
+			raw.fr = ((uint64_t)fr) << (52-fbits);
+			raw.ex = ex + (int32_t)k*(int32_t)(1<<ebits) + MASK(10);
+			return *reinterpret_cast<double*>(&raw);
 		}
 	};
 
 	uint32_t value;
 
 	posit() {
-		value = 0;
+	}
+
+	posit(uint32_t value) {
+		this->value = value;
 	}
 
 	posit(double d) {
-		uint64_t draw = *(uint64_t*)&d;
-		uint8_t dfbits = 52;
-		uint8_t debits = 11;
-
-		uint8_t neg = draw>>63;
-		int16_t e = ((draw >> dfbits) & ((1u << debits)-1u)) - ((1 << (debits-1))-1);
-		uint64_t frac = draw & ((1lu << dfbits)-1);
-
-		//printf("%f e=%d f=%lX\n", d, e, frac);
-
-		int8_t k = e >> ebits;
-		e &= (1u<<ebits)-1u;
-		
-		//printf("k=%d e=%d f=%lX\n", k, e, frac);
-
-		uint8_t m = k < 0 ? -k : k+1;
-		uint8_t rbits = m+1;
-
-		uint8_t fbits = bits-1-rbits-ebits;
-
-		//printf("%u-%u=%d\n", dfbits, fbits, (int8_t)dfbits-(int8_t)fbits);
-
-		frac = (frac>>(dfbits - fbits)) + ((frac>>(dfbits-fbits-1))&1);
-		
-		//printf("m=%d rbits=%d frac=%lX\n", m, rbits, frac);
-
-		uint8_t regime = 1;
-		if (k >= 0) {
-			regime = ((uint8_t)-2) & ((1u << rbits)-1u);
-		}
-
-		//printf("%X\n", regime);
-
-		value = (neg << (bits-1)) | (regime << (fbits+ebits)) | (e << fbits) | frac;
-
-		//printf("value=%X\n", value);
-
-		//uint8_t regime =  
-		//value = (neg << (bits-1)) | (;
+		value = encoding(d).encode();
 	}
 
 	operator double() {
-		uint32_t tmp = value;
-		uint8_t neg = (value >> (bits-1)) & 1;
-		if (neg != 0) {
-			tmp = (~tmp)+1;
+		return encoding(*this);
+	}
+
+	posit<bits, ebits> sigmoid() {
+		if (ebits != 0) {
+			printf("error! this function only works with 0 exponent bits\n");
 		}
-
-		//printf("neg %u\n", neg);
-
-		//printf("%X  %X\n", tmp, tmp<<(1+(32-bits)));
-
-		uint8_t regime = __builtin_clrsb(tmp << (1+(32-bits)))+1;
-		//printf("regime %u\n", regime);
-
-		uint8_t sbits = 1;
-		uint8_t rbits = regime+1;
-		uint8_t fbits = bits - ebits - rbits - sbits;
-
-		//printf("bits s=%u r=%u e=%u f=%u/t=%u\n", sbits, rbits, ebits, fbits, bits);
-		int8_t k = -(int8_t)regime;
-		if ((tmp>>(bits-sbits-1))&1 == 1) {
-			k = (int8_t)regime-1;
-		}
-		//printf("k=%d\n", k);
-		int32_t exponent = (tmp >> fbits) & ((1u<<ebits)-1u);
-		uint32_t fraction = tmp & ((1u<<fbits)-1u);
-		//printf("exponent=%u fraction=%u\n", exponent, fraction);
-
-		double frac = 1.0 + (double)fraction / (double)(1<<fbits);
-		int exp = exponent + (int32_t)k*(int32_t)(1<<ebits);
-		//printf("frac=%f exp=%d\n", frac, exp);
-
-		double mag = pow((double)2.0, exp)*frac;
-		if (neg) {
-			return -mag;
-		}
-		return mag;
+		posit<bits, ebits> result((value ^ (1u<<(bits-1u))) >> 2);
+		return result;
 	}
 };
 
-template <uint8_t bits, uint8_t ebits>
+/*template <uint8_t bits, uint8_t ebits>
 posit<bits, ebits> operator+(posit<bits, ebits> p0, posit<bits, ebits> p1) {
-	p0.value += p1.value;
+	posit<bits, ebits> encoding e0(p0), e1(p1);
+	int8_t dk = e0.k - e1.k;
+	if (e1.k > e0.k) {
+		e0.k = e1.k;
+	}
 	return p0;
-}
-
+}*/
 
 int main() {
-	posit<16, 3> p0 = 3.5;
+	for (double x = -10.0; x < 10.0; x += 0.01) {
+		posit<10, 0> p(x);
+		double xp = p;
+		double y = p.sigmoid();
+		printf("%.10le\t%.10e\t%.10e\n", x, xp, y);
+	}
+	/*posit<16, 3> p0 = 3.5;
 	printf("%.10e + ", (double)p0);
 	posit<16, 3> p1 = 2.5;
 	printf("%.10e = ", (double)p1);
-	printf("%.10e\n", (double)(p0+p1));
+	printf("%.10e\n", (double)(p0+p1));*/
 }
