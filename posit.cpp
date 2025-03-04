@@ -141,7 +141,7 @@ posit<bits, ebits> operator+(posit<bits, ebits> p0, posit<bits, ebits> p1) {
 
 int main() {
 	for (double x = -10.0; x < 10.0; x += 0.01) {
-		posit<10, 0> p(x);
+		posit<8, 0> p(x);
 		double xp = p;
 		double y = p.sigmoid();
 		printf("%.10le\t%.10e\t%.10e\n", x, xp, y);
